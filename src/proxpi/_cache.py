@@ -16,9 +16,15 @@ import dataclasses
 import urllib.parse
 
 import requests
+import requests.adapters
 import lxml.etree
 
 INDEX_URL = os.environ.get("PROXPI_INDEX_URL", "https://pypi.org/simple/")
+# urllib3 connection pool size for upstream requests. Default urllib3 cap is 10,
+# which is far too small once we issue PROXPI_PARALLEL_CONNECTIONS range requests
+# per wheel for many wheels concurrently — overflow triggers TLS reconnects and
+# kills throughput.
+CONNECTION_POOL_SIZE = int(os.environ.get("PROXPI_CONNECTION_POOL_SIZE", 128))
 EXTRA_INDEX_URLS = [
     s for s in os.environ.get("PROXPI_EXTRA_INDEX_URLS", "").strip().split(",") if s
 ]
@@ -362,6 +368,16 @@ class _Locks:
 
 class Session(requests.Session):
     default_timeout: t.Union[float, t.Tuple[float, float], None] = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=CONNECTION_POOL_SIZE,
+            pool_maxsize=CONNECTION_POOL_SIZE,
+            pool_block=False,
+        )
+        self.mount("http://", adapter)
+        self.mount("https://", adapter)
 
     def send(self, request: requests.PreparedRequest, **kwargs) -> requests.Response:
         if self.default_timeout and not kwargs.get("timeout"):
