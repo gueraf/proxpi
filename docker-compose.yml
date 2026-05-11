@@ -1,6 +1,20 @@
 services:
   proxpi:
     restart: unless-stopped
+    build:
+      context: .
     ports:
-      - '5000:5000'
-    image: epicwink/proxpi:latest
+      - '127.0.0.1:5000:5000'
+    environment:
+      # Pure proxy: don't cache wheel bytes on disk, fetch each time
+      PROXPI_CACHE_SIZE: '0'
+      # Parallel HTTP Range requests per wheel fetch (works around per-flow
+      # throttling on the path to upstream PyPI / Fastly)
+      PROXPI_PARALLEL_CONNECTIONS: '16'
+      # Minimum file size before we bother splitting (2 MiB)
+      PROXPI_PARALLEL_MIN_SIZE: '2097152'
+      # Keep index metadata cached so resolution stays fast
+      PROXPI_INDEX_TTL: '1800'
+    # Enough threads to handle uv's concurrent requests; each request may spawn
+    # up to PROXPI_PARALLEL_CONNECTIONS sub-threads for range fetches
+    command: ["--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "16", "--no-control-socket"]
