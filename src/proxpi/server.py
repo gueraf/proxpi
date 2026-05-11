@@ -6,6 +6,7 @@ import zlib
 import typing as t
 import logging
 import urllib.parse
+import concurrent.futures
 
 import flask
 import jinja2
@@ -129,6 +130,75 @@ BINARY_FILE_MIME_TYPE = (
 ).lower() not in ("", "0", "no", "off", "false")
 _file_mime_type = "application/octet-stream" if BINARY_FILE_MIME_TYPE else None
 
+# Parallel range-request download settings (helps when the upstream path has
+# per-flow throttling and a single TCP connection can't fill the pipe).
+PARALLEL_CONNECTIONS = int(os.environ.get("PROXPI_PARALLEL_CONNECTIONS", "1"))
+# Minimum file size (bytes) before we bother with parallel ranges
+PARALLEL_MIN_SIZE = int(os.environ.get("PROXPI_PARALLEL_MIN_SIZE", str(2 * 1024 * 1024)))
+
+
+def _parallel_download_bytes(url: str, num_connections: int) -> bytes:
+    """Fetch ``url`` using ``num_connections`` parallel HTTP range requests.
+
+    Falls back to a single GET if the server doesn't advertise byte ranges,
+    if the file is small, or if the HEAD probe fails.
+    """
+
+    session = cache.file_cache.session
+    head = session.head(url, allow_redirects=True, timeout=30)
+    head.raise_for_status()
+
+    accept_ranges = head.headers.get("Accept-Ranges", "").lower()
+    content_length = head.headers.get("Content-Length")
+
+    if accept_ranges != "bytes" or not content_length:
+        logger.debug("Range requests unsupported, single GET for %s", _cache._mask_password(url))
+        r = session.get(url, timeout=300)
+        r.raise_for_status()
+        return r.content
+
+    size = int(content_length)
+    if size < PARALLEL_MIN_SIZE or num_connections <= 1:
+        r = session.get(url, timeout=300)
+        r.raise_for_status()
+        return r.content
+
+    n = num_connections
+    chunk_size = size // n
+    chunks: t.List[t.Union[bytes, None]] = [None] * n
+
+    def fetch(idx: int, start: int, end: int) -> None:
+        resp = session.get(
+            url, headers={"Range": f"bytes={start}-{end}"}, timeout=300
+        )
+        resp.raise_for_status()
+        chunks[idx] = resp.content
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+        futures = []
+        for i in range(n):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size - 1 if i < n - 1 else size - 1
+            futures.append(ex.submit(fetch, i, start, end))
+        for f in futures:
+            f.result()
+
+    return b"".join(chunks)  # type: ignore[arg-type]
+
+
+def _parallel_proxy(url: str) -> flask.Response:
+    """Serve ``url`` to the client after fetching with parallel range requests."""
+    try:
+        data = _parallel_download_bytes(url, PARALLEL_CONNECTIONS)
+    except Exception as e:
+        logger.warning(
+            "Parallel download failed for %s (%s); redirecting",
+            _cache._mask_password(url),
+            e,
+        )
+        return flask.redirect(url)
+    return flask.Response(data, mimetype=_file_mime_type or "application/octet-stream")
+
 
 def _compress(response: t.Union[str, flask.Response]) -> flask.Response:
     response = flask.make_response(response)
@@ -222,6 +292,8 @@ def get_file(package_name: str, file_name: str):
         raise
     scheme = urllib.parse.urlparse(path).scheme
     if scheme and scheme != "file":
+        if PARALLEL_CONNECTIONS > 1:
+            return _parallel_proxy(path)
         return flask.redirect(path)
     response = flask.send_file(path, mimetype=_file_mime_type)
     if (
