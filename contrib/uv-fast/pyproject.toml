@@ -1,0 +1,20 @@
+[project]
+name = "uv-fast"
+version = "0.1.0"
+description = "uv wrapper that routes through a local proxpi when one is running"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Fabian Guera" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+uv-fast = "uv_fast:main"
+uvf = "uv_fast:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["uv_fast"]
